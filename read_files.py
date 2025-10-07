@@ -97,11 +97,11 @@ def align_by_abs_time_diff(
 if __name__ == '__main__':
     # Define input/output file paths
     base_path = r"D:\PPH"
-    input_file_path = os.path.join(base_path, "pph_wide_timeline_part01.xlsx")
+    input_file_path = os.path.join(base_path, "measurements.csv")
     output_file_path = os.path.join(base_path, "pph_wide_timeline_part01_small.xlsx")
 
     # Load raw data
-    df = pd.read_excel(input_file_path, nrows=1000)
+    df = pd.read_csv(input_file_path)
     write_excel_file(df, output_file_path)
 
     # Clean and preprocess data

@@ -1,8 +1,8 @@
 # ============================================================
-# PPH wide timeline (birth-aligned) — fast & Excel-safe
+# PPH wide timeline (birth-aligned) — fast & pickle-based
 #   - Inputs: CSVs (paths below)
-#   - Caches: Pickle (.pkl) (fast reload, avoids Excel limits)
-#   - Output: Excel (.xlsx); auto-splits into ..._partNN.xlsx (header-aware)
+#   - Caches: Pickle (.pkl) for vitals/labs/drugs/birth map
+#   - Output: Pickle (.pkl) single file with the merged timeline
 #
 #   Measurements: parameter_time → wide (ONLY: BP-Mean, diastol, sistol, saturation, heat, pulse)
 #   Labs: ResultTime → wide (one col per TestName, numeric)
@@ -10,12 +10,12 @@
 #   Births: robust birth_datetime per mother
 #   Merge: outer join on (hashed_mother_id, event_time_abs)
 #   Dedup: per mother, merge rows < 1 second apart (vectorized)
-#   Speed-ups: column-pruned CSV reads, no .apply in hot paths, chunked Excel writes
+#   Speed-ups: column-pruned CSV reads, no .apply in hot paths
 # ============================================================
 
 import os
 import re
-import math
+import math  # (not strictly needed now, but left in case of future tweaks)
 from datetime import time
 import numpy as np
 import pandas as pd
@@ -36,14 +36,8 @@ CACHE_LABS_WIDE        = os.path.join(BASE_DIR, "cache_labs_wide.pkl")
 CACHE_DRUGS_WIDE       = os.path.join(BASE_DIR, "cache_drugs_wide.pkl")
 CACHE_BIRTHS_MAP       = os.path.join(BASE_DIR, "cache_birth_per_mother.pkl")
 
-# Output (XLSX, chunked if too big)
-OUT_TIMELINE_BASENAME  = os.path.join(BASE_DIR, "pph_wide_timeline.xlsx")
-
-# Excel hard limits
-MAX_XLSX_ROWS = 1_048_576
-MAX_XLSX_COLS = 16_384
-# Account for header row
-MAX_DATA_ROWS_PER_SHEET = MAX_XLSX_ROWS - 1
+# Final Output (PKL)
+OUT_TIMELINE_PKL       = os.path.join(BASE_DIR, "pph_wide_timeline.pkl")
 
 # OPTIONAL: prune events to a window around birth to speed up massively (set to numbers to enable)
 TIME_WINDOW_BEFORE_H = None  # e.g., 24
@@ -87,12 +81,11 @@ def parse_time_of_day(x):
         secs_total = td.total_seconds()
         secs_int = int(secs_total)
         frac = secs_total - secs_int
-        hh = secs_int // 3600  # <-- fixed
+        hh = secs_int // 3600
         mm = (secs_int % 3600) // 60
         ss = (secs_int % 60) + frac
         return time(int(hh), int(mm), int(ss), int((ss % 1) * 1_000_000))
     return None
-
 
 
 def fmt_signed_hms_tenths(delta_seconds):
@@ -118,71 +111,37 @@ def safe_col(name: str) -> str:
 
 
 # -----------------------------
-# IO helpers (column-pruned CSV in, PKL cache out, XLSX out)
+# IO helpers (column-pruned CSV in, PKL cache out)
 # -----------------------------
+def _read_csv_usecols(path: str, wanted_cols: list[str]) -> pd.DataFrame:
+    header = pd.read_csv(path, nrows=0)
+    use = [c for c in wanted_cols if c in header.columns]
+    return pd.read_csv(path, usecols=use)
+
 def load_measurements(path: str) -> pd.DataFrame:
     usecols = [
         "hashed_mother_id", "er_admission_date", "department_admission", "department_discharge",
         "parameter_time", "Parameter_Name", "ResultNumeric", "flag"
     ]
-    df = pd.read_csv(path, usecols=[c for c in usecols if c in pd.read_csv(path, nrows=0).columns])
-    return df
+    return _read_csv_usecols(path, usecols)
 
 def load_labs(path: str) -> pd.DataFrame:
-    usecols = [
-        "hashed_mother_id", "ResultTime", "TestName", "Result"
-    ]
-    df = pd.read_csv(path, usecols=[c for c in usecols if c in pd.read_csv(path, nrows=0).columns])
-    return df
+    usecols = ["hashed_mother_id", "ResultTime", "TestName", "Result"]
+    return _read_csv_usecols(path, usecols)
 
 def load_drugs(path: str) -> pd.DataFrame:
-    usecols = [
-        "hashed_mother_id", "ExecutionTime", "DrugName"
-    ]
-    df = pd.read_csv(path, usecols=[c for c in usecols if c in pd.read_csv(path, nrows=0).columns])
-    return df
+    usecols = ["hashed_mother_id", "ExecutionTime", "DrugName"]
+    return _read_csv_usecols(path, usecols)
 
 def load_births(path: str) -> pd.DataFrame:
-    usecols = [
-        "hashed_mother_id", "child_birth_date", "birth_time"
-    ]
-    df = pd.read_csv(path, usecols=[c for c in usecols if c in pd.read_csv(path, nrows=0).columns])
-    return df
+    usecols = ["hashed_mother_id", "child_birth_date", "birth_time"]
+    return _read_csv_usecols(path, usecols)
 
 def save_pkl(df: pd.DataFrame, path: str) -> None:
     df.to_pickle(path)
 
 def load_pkl(path: str) -> pd.DataFrame:
     return pd.read_pickle(path)
-
-def save_xlsx_safely(df: pd.DataFrame, base_path: str, sheet_name: str = "timeline") -> None:
-    """
-    Save DataFrame to one or more .xlsx files without exceeding Excel limits.
-    We always write headers; each chunk contains at most MAX_DATA_ROWS_PER_SHEET data rows.
-    """
-    n_rows, n_cols = df.shape
-    col_chunks = math.ceil(n_cols / MAX_XLSX_COLS)
-    row_chunks = max(1, math.ceil(n_rows / MAX_DATA_ROWS_PER_SHEET)) if n_rows else 1
-    part = 0
-    for ci in range(col_chunks):
-        c_start = ci * MAX_XLSX_COLS
-        c_end = min((ci + 1) * MAX_XLSX_COLS, n_cols)
-        cols_chunk = df.columns[c_start:c_end]
-        for ri in range(row_chunks):
-            r_start = ri * MAX_DATA_ROWS_PER_SHEET
-            r_end = min((ri + 1) * MAX_DATA_ROWS_PER_SHEET, n_rows)
-            if r_start >= r_end:
-                continue
-            chunk = df.iloc[r_start:r_end, c_start:c_end]
-            part += 1
-            if col_chunks == 1 and row_chunks == 1:
-                out_path = base_path
-            else:
-                root, ext = os.path.splitext(base_path)
-                out_path = f"{root}_part{part:02d}{ext}"
-            with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-                chunk.to_excel(writer, sheet_name=sheet_name, index=False)
-            print(f"Saved: {out_path}  (rows {r_start}-{r_end-1}, cols {c_start}-{c_end-1})")
 
 
 # -----------------------------
@@ -317,7 +276,6 @@ def get_or_build_labs_wide(labs: pd.DataFrame, anchors: pd.DataFrame, use_cache:
     labs["TestName_safe"] = labs.get("TestName").map(lambda x: safe_col(str(x).upper()))
     labs["Result_num"] = pd.to_numeric(labs.get("Result"), errors="coerce")
 
-    # Faster pivot (same trick as vitals)
     labs = labs.sort_values(["hashed_mother_id", "event_time_abs"]).drop_duplicates(
         subset=["hashed_mother_id", "event_time_abs", "TestName_safe"], keep="last"
     )
@@ -355,7 +313,6 @@ def normalize_pph_drug_name(drug: str):
     if "SODIUM CHLORIDE" in s and "0.9%" in s:
         return "SODIUM_CHLORIDE_0_9"
     # (Add TXA here if you have it.)
-
     return None
 
 
@@ -495,7 +452,6 @@ def collapse_near_duplicates_fast(df: pd.DataFrame,
     return compact
 
 
-
 # -----------------------------
 # Build pipeline
 # -----------------------------
@@ -541,8 +497,8 @@ def build_wide_timeline(base_dir: str, use_cache: bool = True) -> pd.DataFrame:
 def main():
     os.makedirs(BASE_DIR, exist_ok=True)
     df = build_wide_timeline(BASE_DIR, use_cache=True)
-    save_xlsx_safely(df, OUT_TIMELINE_BASENAME, sheet_name="timeline")
-    print("Done.")
+    df.to_pickle(OUT_TIMELINE_PKL)
+    print(f"Saved pickle: {OUT_TIMELINE_PKL}")
 
 
 if __name__ == "__main__":
