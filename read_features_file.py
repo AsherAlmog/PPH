@@ -44,8 +44,8 @@ CFG: Dict = {
     # -------- Paths (from builder) --------
     "base_dir": r"D:\PPH",
     "features_all_path": r"D:\PPH\features_all.parquet",
-    "labels_all_path":   r"D:\PPH\out_labels\labels_vector.parquet",
-    "feature_cols_json": r"D:\PPH\feature_columns.json",
+    "labels_all_path":   r"D:\PPH\labels_all.parquet",
+    "feature_cols_json": r"D:\PPH\feature_columns_all.json",
 
     # Optional: CSV with a column of hashed_mother_id to KEEP
     "keep_mothers_csv": None,          # e.g. r"D:\PPH\keep_mothers.csv"
@@ -72,7 +72,7 @@ CFG: Dict = {
     # Static features are always kept regardless of this list.
     # Example: ["HGB", "sistol", "BP", "MAP"]. Leave empty to disable.
     "keep_only_name_contains": ["sistol", "diastol", "bp - mean", "map", "pulse", "saturation",
-        "shock_index", "si_", "shockindex"],
+        "shock_index", "si_", "shockindex", "HGB", "HCT", "PP"],
 
     # --------- NEW: drop ALL real-time measurement features (keep all static) ----------
     "drop_realtime_measurements": False,
@@ -81,17 +81,17 @@ CFG: Dict = {
     "realtime_measurement_patterns": [
         # vital signs
         "sistol", "diastol", "bp - mean", "map", "pulse", "saturation", "heat",
-        "shock_index", "si_", "shockindex",
+        "shock_index", "si_", "shockindex", "PP",
         # labs
         "hgb", "hct", "plt", "fibrinogen", "wbc",
         "sodium_blood", "creatinine_blood", "uric_acid_blood",
         # time-resolution hints
-        "_fine_", "_coarse_",
+        "_fine_", "_coarse_"
     ],
 
     # ------------- Name-based pruning (drop) -------------
     # If any of these substrings appear in a feature name, DROP that column (before reading parquet)
-    "drop_if_name_contains": [
+    "drop_if_name_contains": ["delta_t"
         # e.g. "z_last", "iqr", "cov", "drug_", "given_", "pp_stats",
     ],
 
@@ -126,7 +126,7 @@ CFG: Dict = {
     "min_feature_variance": 1e-12,
 
     # ------------- Validation ---------------
-    "validation_strategy": "holdout",   # "holdout" or "group_kfold"
+    "validation_strategy": "group_kfold",   # "group_kfold" or "group_kfold"
     "holdout_group_frac": 0.2,
     "group_kfold_splits": 5,
     "random_state": 42,
@@ -160,8 +160,8 @@ CFG: Dict = {
     "feat_top_n": 30,
 
     # ------------- Caching ------------------
-    "matrices_cache_enabled": False,
-    "matrices_force_recompute": False,
+    "matrices_cache_enabled": True,
+    "matrices_force_recompute": True,
     "matrices_cache_dir":   r"D:\PPH\.cache_xgb",
     "matrices_cache_X":     r"D:\PPH\.cache_xgb\Xdf.parquet",
     "matrices_cache_y":     r"D:\PPH\.cache_xgb\y.parquet",
@@ -169,13 +169,13 @@ CFG: Dict = {
     "matrices_cache_cols":  r"D:\PPH\.cache_xgb\used_cols.json",
 
     # --------- Balancing (train only) -------
-    "downsample_training_to_even": True,
+    "downsample_training_to_even": False,
     "downsample_random_state": 123,
 
     # --------- Histograms -------------------
     "hist_top_n": 50,
     "hist_bins": 40,
-    "out_hist_dir": r"D:\PPH\top_feature_hist",
+    "out_hist_dir": r"D:\PPH\top_feature_hist_1810",
     "hist_plot_all_used": True,   # plot ALL used features when True
 }
 

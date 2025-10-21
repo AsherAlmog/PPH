@@ -821,7 +821,6 @@ def build_wide_timeline(base_dir: str, force_recompute: bool = False) -> pd.Data
         merged_wide = collapse_near_duplicates_fast(merged_wide, vitals_cols, lab_cols, drug_cols, threshold_seconds=1.0)
 
     # Align labels to birth + episode (SEPARATE FILE; NOT merged into timeline)
-    force_recompute = True
     with _timer("labels_align"):
         labels_aligned = build_labels_aligned(labels, births_all, ep_bounds, force=force_recompute)
 

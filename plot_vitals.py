@@ -9,8 +9,8 @@ import matplotlib.pyplot as plt
 
 # ===================== CONFIG =====================
 CFG: Dict = {
-    "features_path": r"D:\PPH\features_all.parquet",
-    "labels_path":   r"D:\PPH\out_labels\labels_vector.parquet",
+    "features_path": r"D:\PPH\features_all_sub.parquet",
+    "labels_path":   r"D:\PPH\labels_all_sub.parquet",
 
     "n_per_class": 25,
     "random_state": 123,

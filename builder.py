@@ -1,28 +1,25 @@
-# build_features_personalized_v4_pregIndexParallel.py
+# build_features_personalized_v2.py
 # High-performance PPH feature builder with integrated labeling
-# - Integrated STATIC generation (mothers + fetus) from CSVs
-# - **Pregnancy index derived per mother** by sorting mothers-static rows
-#   (fetus_count, then number_of_pregnancies_G) and assigning ranks 1..N
-#   — parallelized across mothers with joblib
 # - Numba-accelerated per-window stats (fine & coarse)
 # - Thread/process parallelism (kernels release the GIL)
-# - Labeling: "pre-dose last frame" logic
+# - Labeling: "pre-dose last frame" logic:
+#     * For positive births (with ≥1 dose time):
+#         - Keep negatives only before the first dose
+#         - For each dose, keep exactly one positive frame: the last snapshot t strictly before the dose
+#           satisfying 0 < (dose_time - t) <= label_pos_window_hours
+#         - Drop all frames between doses and after the last dose
+#     * For births with no doses: keep all frames as negatives
 # - Min-sample gating; delta, delta_t, LS slope
-# - Derived hemodynamics: MAP, SI, PP (pulse pressure)
+# - Windowed derived hemodynamics: MAP, SI (NO PP)
 # - Personalized deltas from static baselines (24h before birth)
 # - Implausibles masked (set to NaN)
-# - Static merge after stripping any measurement/lab columns (avoid leakage)
+# - Static merge after stripping any measurement/lab columns
 # - Robust, exact datetime parsing for dose/product timestamps
-# - Fetus aggregation per **mother** (gender & pose encoded); replicated to every pregnancy of that mother
 
 from __future__ import annotations
 
-import json
-import os
-import re
-import tempfile
+import json, os, tempfile, re
 from contextlib import contextmanager as _cm
-from time import perf_counter
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -49,50 +46,40 @@ except Exception:
 CFG: Dict = {
     # -------- Paths --------
     "base_dir": r"D:\PPH",
-    "realtime_pickle": r"D:\PPH\pph_wide_timeline.pkl",   # wide realtime with event_time_abs
-
-    # STATIC inputs (integrated build; we do NOT read a prebuilt static_merged)
-    "mothers_csv": r"D:\PPH\MF_Maternal_table_20250812.csv",
-    "fetus_csv":   r"D:\PPH\MF_FETAL_TABL_20250812_132000.csv",
-
-    # (legacy) If present in your old config, it's now ignored; we always derive pregnancy_index by sorting
-    "mothers_pregnancy_index_col": "fetus_count",
-
-    # Optional outputs from the static builder (for inspection/reuse)
-    "out_static_csv": r"D:\PPH\static_per_pregnancy.csv",
-    "out_pose_codebook_json": r"D:\PPH\fetus_pose_codebook.json",
+    "realtime_pickle": r"D:\PPH\pph_wide_timeline.pkl",   # contains realtime (wide) with event_time_abs
 
     # You may provide either/both. If labels_doses_csv exists, we use it.
-    # Else we fall back to aligned_labels_csv (event_time_abs,label>0).
-    "labels_doses_csv": r"D:\PPH\processed_drugs_new.csv",
-    "aligned_labels_csv": r"D:\PPH\pph_labels_aligned.csv",
+    # Otherwise we fall back to aligned_labels_csv with (event_time_abs,label) and derive doses from label>0 rows.
+    "labels_doses_csv": r"D:\PPH\processed_drugs_new.csv",    # wide columns like blood_dose_*, blood_product_*
+    "aligned_labels_csv": r"D:\PPH\pph_labels_aligned.csv",   # optional fallback: hashed_mother_id,pregnancy_index,event_time_abs,label
 
     # -------- Output --------
-    "out_features_rt_only_parquet":         r"D:\PPH\features_rt_only.parquet",
-    "out_features_rt_plus_static_parquet":  r"D:\PPH\features_all.parquet",
-    "out_labels_all_parquet":               r"D:\PPH\labels_all.parquet",
-    "out_feature_cols_rt_only_json":        r"D:\PPH\feature_columns_rt_only.json",
-    "out_feature_cols_rt_plus_static_json": r"D:\PPH\feature_columns_all.json",
+    "out_features_rt_only_parquet":         r"D:\PPH\features_rt_only_sub.parquet",
+    "out_features_rt_plus_static_parquet":  r"D:\PPH\features_all_sub.parquet",
+    "out_labels_all_parquet":               r"D:\PPH\labels_all_sub.parquet",
+    "out_feature_cols_rt_only_json":        r"D:\PPH\feature_columns_rt_only_sub.json",
+    "out_feature_cols_rt_plus_static_json": r"D:\PPH\feature_columns_sub.json",
 
     # -------- Feature grid & windows --------
-    "fine_step_hours": 1.0,       # snapshot cadence
-    "fine_window_hours": 3.0,     # fine lookback
-    "coarse_window_hours": 12.0,  # coarse lookback
-    "min_samples_per_window": 3,
+    "fine_step_hours": 1.0,       # snapshot grid step (keep this at 1h to match your plan)
+    "fine_window_hours": 3.0,
+    "coarse_window_hours": 12.0,
 
     # -------- Labeling (pre-dose last-frame) --------
-    # t is positive for a dose at T_dose iff: t < T_dose and (T_dose - t) <= label_pos_window_hours
+    # A snapshot time t is positive for a dose at T_dose iff:
+    #   t < T_dose and (T_dose - t) <= label_pos_window_hours
+    # With 1-hour snapshots, this marks exactly the last snapshot before each dose.
     "label_pos_window_hours": 1.0,
 
-    # -------- Signals --------
+    # -------- Configure signals --------
     "measurements": ["sistol", "diastol", "BP - Mean", "saturation", "heat", "pulse"],
     "labs": ["HGB", "HCT", "PLT", "FIBRINOGEN", "WBC", "SODIUM_BLOOD", "CREATININE_BLOOD", "URIC_ACID_BLOOD"],
 
-    # Baseline aliases (static) for personalized deltas; we look for "*24h_last_before_birth"
+    # Baseline aliases (static)
     "measurement_baseline_alias": {
         "heat": ["temp", "temperature"],
-        "sistol": ["systolic", "systolic_pressure", "sbp"],
-        "diastol": ["diastolic", "diastolic_pressure", "dbp"],
+        "sistol": ["systolic", "sbp"],
+        "diastol": ["diastolic", "dbp"],
         "pulse": ["hr", "heart_rate"],
         "saturation": ["sat", "spo2"],
         "BP - Mean": ["map", "bp_mean"]
@@ -107,7 +94,6 @@ CFG: Dict = {
         "heat": (34, 41),
         "_MAP": (40, 170),
         "_SI": (0.2, 3.5),
-        "_PP": (10, 150),  # pulse pressure
         "HGB": (3, 20),
         "HCT": (10, 60),
         "PLT": (20_000, 1_000_000),
@@ -118,7 +104,7 @@ CFG: Dict = {
         "URIC_ACID_BLOOD": (1, 15),
     },
 
-    # -------- Episode segmentation --------
+    # -------- Pregnancy / episodes --------
     "episode_gap_days": 183,
 
     # -------- Subsample BEFORE workers (optional) --------
@@ -129,27 +115,69 @@ CFG: Dict = {
     # -------- Parallelization --------
     "n_jobs": -1,
     "parallel_backend": "threads",  # 'threads' or 'loky' (processes)
-    "rt_parquet_dataset_dir": r"D:\PPH\.cache_builder\rt_dataset",  # process backend cache
 
-    # -------- Measuring frequency filter --------
-    # If >0: drop mothers who have NO blood doses AND whose max vital freq < this threshold (per hour)
-    "min_vital_freq_per_hour": 1.0,
+    # Cache for process backend
+    "rt_parquet_dataset_dir": r"D:\PPH\.cache_builder\rt_dataset",
 
     # -------- Timing --------
     "print_timing": True,
 }
+
+def _subsample_births_by_dose(rt: pd.DataFrame,
+                              dose_times: pd.DataFrame,
+                              cfg: Dict) -> pd.DataFrame:
+    """
+    Balanced subsample of births (mother, episode):
+      - 'Positive' birth: has ≥1 dose_time in dose_times
+      - 'Negative' birth: has no doses
+    Keeps up to cfg['subsample_n_per_class'] from each class (or all if fewer).
+    """
+    if rt.empty:
+        return rt
+    n_per = int(cfg.get("subsample_n_per_class", 2500))
+    seed  = int(cfg.get("subsample_seed", 111))
+
+    # Normalize types
+    R = rt[["hashed_mother_id", "episode_idx"]].drop_duplicates().copy()
+    R["hashed_mother_id"] = R["hashed_mother_id"].astype(str)
+    R["episode_idx"] = pd.to_numeric(R["episode_idx"], errors="coerce").astype("Int64")
+
+    D = dose_times[["hashed_mother_id", "episode_idx"]].drop_duplicates().copy() if (dose_times is not None and not dose_times.empty) else pd.DataFrame(columns=["hashed_mother_id","episode_idx"])
+    if not D.empty:
+        D["hashed_mother_id"] = D["hashed_mother_id"].astype(str)
+        D["episode_idx"] = pd.to_numeric(D["episode_idx"], errors="coerce").astype("Int64")
+
+    births = R.merge(D.assign(has_dose=1), on=["hashed_mother_id","episode_idx"], how="left")
+    births["has_dose"] = births["has_dose"].fillna(0).astype("int8")
+
+    pos_births = births[births["has_dose"] == 1]
+    neg_births = births[births["has_dose"] == 0]
+
+    # Sample up to n_per from each class
+    if len(pos_births) > n_per:
+        pos_births = pos_births.sample(n=n_per, random_state=seed)
+    if len(neg_births) > n_per:
+        neg_births = neg_births.sample(n=n_per, random_state=seed)
+
+    keep_births = pd.concat([pos_births, neg_births], ignore_index=True)
+
+    # Filter realtime rows to the kept births
+    keep = rt.merge(keep_births[["hashed_mother_id","episode_idx"]],
+                    on=["hashed_mother_id","episode_idx"], how="inner")
+    print(f"[SUBSAMPLE] pos_births_kept={pos_births.shape[0]:,}  neg_births_kept={neg_births.shape[0]:,}  rows_after_filter={len(keep):,}")
+    return keep
 
 
 # =============================================================================
 # Timing helper
 # =============================================================================
 _TIMINGS: Dict[str, float] = {}
+from time import perf_counter
 
 @_cm
 def timed(name: str):
     t0 = perf_counter()
-    try:
-        yield
+    try: yield
     finally:
         _TIMINGS[name] = _TIMINGS.get(name, 0.0) + (perf_counter() - t0)
         if CFG.get("print_timing", True):
@@ -157,13 +185,9 @@ def timed(name: str):
 
 
 # =============================================================================
-# Datetime parsing helpers
+# Strict datetime parsing for second-level resolution
 # =============================================================================
 _SEC_FMT = "%Y-%m-%d %H:%M:%S"
-LABELS_FMT_WITH_FRACT  = "%Y-%m-%d %H:%M:%S.%f"
-LABELS_FMT_NO_FRACT    = "%Y-%m-%d %H:%M:%S"
-LABELS_RE_WITH_FRACT   = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+$")
-LABELS_RE_NO_FRACT     = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
 def _normalize_to_seconds_str(s: pd.Series) -> pd.Series:
     if np.issubdtype(s.dtype, np.datetime64):
@@ -174,8 +198,17 @@ def _normalize_to_seconds_str(s: pd.Series) -> pd.Series:
 def _parse_datetime_series(s: pd.Series) -> pd.Series:
     return pd.to_datetime(_normalize_to_seconds_str(s), format=_SEC_FMT)
 
+
+# =============================================================================
+# Robust exact parsing utilities for labels_doses_csv
+# =============================================================================
+LABELS_FMT_WITH_FRACT  = "%Y-%m-%d %H:%M:%S.%f"
+LABELS_FMT_NO_FRACT    = "%Y-%m-%d %H:%M:%S"
+LABELS_RE_WITH_FRACT   = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+$")
+LABELS_RE_NO_FRACT     = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
 def _nonempty_mask(s: pd.Series) -> pd.Series:
-    return s.notna() & s.astype("string").str.strip().ne("")
+    return s.notna() & (s.astype(str).str.strip() != "")
 
 def _parse_labels_time_exact(s: pd.Series) -> pd.Series:
     s = s.astype(str).str.strip()
@@ -183,35 +216,27 @@ def _parse_labels_time_exact(s: pd.Series) -> pd.Series:
     m1 = s.str.match(LABELS_RE_WITH_FRACT)
     m2 = s.str.match(LABELS_RE_NO_FRACT)
     if m1.any():
-        out.loc[m1] = pd.to_datetime(s.loc[m1], format=LABELS_FMT_WITH_FRACT)
+        out.loc[m1] = pd.to_datetime(s.loc[m1], format=LABELS_FMT_WITH_FRACT)  # no coerce
     if m2.any():
-        out.loc[m2] = pd.to_datetime(s.loc[m2], format=LABELS_FMT_NO_FRACT)
+        out.loc[m2] = pd.to_datetime(s.loc[m2], format=LABELS_FMT_NO_FRACT)    # no coerce
     return out
 
 
 # =============================================================================
-# Globals for workers
+# Globals for workers (for joblib)
 # =============================================================================
 _CFG: Optional[Dict] = None
 _RT_MEM: Optional[pd.DataFrame] = None
 _RT_DS_PATH: Optional[str] = None
+
+# Dose times store (tidy): columns [hashed_mother_id, episode_idx, dose_time]
 _DOSE_TIMES: Optional[pd.DataFrame] = None
-_STATIC_FULL: Optional[pd.DataFrame] = None
-_POSE_CODEBOOK: Dict[str, int] = {}
+
+_STATIC_FULL: Optional[pd.DataFrame] = None  # unstripped static for baselines
 
 
 # =============================================================================
-# Joblib backend args
-# =============================================================================
-def _joblib_backend_args(cfg: Dict):
-    be = cfg.get("parallel_backend", "threads").lower()
-    if be in ("loky", "process", "processes"):
-        return dict(backend="loky", prefer="processes")
-    return dict(backend="threading", prefer="threads")
-
-
-# =============================================================================
-# Numba window kernels (with Python fallback)
+# Fast per-window kernels (Numba)
 # =============================================================================
 def _ensure_contig_int64(a: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(a.astype(np.int64, copy=False))
@@ -336,364 +361,40 @@ if _HAVE_NUMBA:
 
 
 # =============================================================================
-# Subsampling births helper
+# Loaders & utilities
 # =============================================================================
-def _subsample_births_by_dose(rt: pd.DataFrame,
-                              dose_times: pd.DataFrame,
-                              cfg: Dict) -> pd.DataFrame:
-    if rt.empty:
-        return rt
-    n_per = int(cfg.get("subsample_n_per_class", 2500))
-    seed  = int(cfg.get("subsample_seed", 111))
+def _joblib_backend_args(cfg: Dict):
+    be = cfg.get("parallel_backend", "threading").lower()
+    if be in ("loky", "process", "processes"):
+        return dict(backend="loky", prefer="processes")
+    return dict(backend="threading", prefer="threads")
 
-    R = rt[["hashed_mother_id", "episode_idx"]].drop_duplicates().copy()
-    R["hashed_mother_id"] = R["hashed_mother_id"].astype(str)
-    R["episode_idx"] = pd.to_numeric(R["episode_idx"], errors="coerce").astype("Int64")
-
-    D = dose_times[["hashed_mother_id", "episode_idx"]].drop_duplicates().copy() if (dose_times is not None and not dose_times.empty) else pd.DataFrame(columns=["hashed_mother_id","episode_idx"])
-    if not D.empty:
-        D["hashed_mother_id"] = D["hashed_mother_id"].astype(str)
-        D["episode_idx"] = pd.to_numeric(D["episode_idx"], errors="coerce").astype("Int64")
-
-    births = R.merge(D.assign(has_dose=1), on=["hashed_mother_id","episode_idx"], how="left")
-    births["has_dose"] = births["has_dose"].fillna(0).astype("int8")
-
-    pos_births = births[births["has_dose"] == 1]
-    neg_births = births[births["has_dose"] == 0]
-
-    if len(pos_births) > n_per:
-        pos_births = pos_births.sample(n=n_per, random_state=seed)
-    if len(neg_births) > n_per:
-        neg_births = neg_births.sample(n=n_per, random_state=seed)
-
-    keep_births = pd.concat([pos_births, neg_births], ignore_index=True)
-    keep = rt.merge(keep_births[["hashed_mother_id","episode_idx"]],
-                    on=["hashed_mother_id","episode_idx"], how="inner")
-    print(f"[SUBSAMPLE] pos_births_kept={pos_births.shape[0]:,}  neg_births_kept={neg_births.shape[0]:,}  rows_after_filter={len(keep):,}")
-    return keep
-
-
-# =============================================================================
-# Mothers static + Fetus aggregation (integrated STATIC builder)
-# =============================================================================
-def _to_minutes(x: str) -> float:
-    if pd.isna(x):
-        return np.nan
-    s = str(x).strip().replace(",", ".")
-    if s == "":
-        return np.nan
-    parts = s.split(":")
-    try:
-        if len(parts) == 3:
-            h, m, sec = float(parts[0]), float(parts[1]), float(parts[2])
-            return h * 60 + m + sec / 60
-        if len(parts) == 2:
-            a, b = float(parts[0]), float(parts[1])
-            if a >= 24 and b < 60:
-                return a + b / 60
-            return a * 60 + b
-        if len(parts) == 1:
-            return float(parts[0])
-    except Exception:
-        return np.nan
-    return np.nan
-
-def _coerce_num(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce")
-
-def _gender_to_bin(x: str) -> float:
-    if pd.isna(x):
-        return np.nan
-    s = str(x).strip().lower()
-    if s in ("female", "f", "0"): return 0.0
-    if s in ("male", "m", "1"):   return 1.0
-    if s.startswith("f"): return 0.0
-    if s.startswith("m"): return 1.0
-    if "נקבה" in s: return 0.0
-    if "זכר" in s: return 1.0
-    return np.nan
-
-def _norm_pose_text(x: str) -> str:
-    if pd.isna(x):
-        return ""
-    s = str(x).strip().lower().strip(" .,:;!?")
-    return s
-
-def _factorize_pose(series: pd.Series) -> Tuple[pd.Series, Dict[str, int]]:
-    ser = series.fillna("").map(_norm_pose_text)
-    uniques = sorted(u for u in ser.unique() if u != "")
-    codebook = {u: i for i, u in enumerate(uniques)}
-    codes = ser.map(lambda u: codebook.get(u, np.nan)).astype("float64")
-    return codes, codebook
-
-def _assign_pregnancy_indices_parallel(mothers_df: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
-    """
-    For each mother, sort rows by (fetus_count asc, number_of_pregnancies_G asc) and assign pregnancy_index = 1..N.
-    Parallelized across mothers.
-    """
-    if mothers_df.empty:
-        mothers_df["pregnancy_index"] = pd.Series(dtype="Int64")
-        return mothers_df
-
-    df = mothers_df.copy()
-    df["_row_order"] = np.arange(len(df))  # stable tiebreaker
-
-    # Ensure numeric keys (push NaN to end by filling with a big number for sorting only)
-    fc = pd.to_numeric(df.get("fetus_count", pd.Series(index=df.index, dtype="float64")), errors="coerce")
-    pg = pd.to_numeric(df.get("number_of_pregnancies_G", pd.Series(index=df.index, dtype="float64")), errors="coerce")
-    df["_sort_fc"] = fc
-    df["_sort_pg"] = pg
-
-    mothers = df["hashed_mother_id"].astype(str).unique().tolist()
-
-    def _rank_one(mid: str) -> pd.DataFrame:
-        sub = df[df["hashed_mother_id"] == mid].copy()
-        # NaNs to +inf for sort placement at end, keep mergesort for stability
-        sub["_fc_fill"] = sub["_sort_fc"].fillna(np.inf)
-        sub["_pg_fill"] = sub["_sort_pg"].fillna(np.inf)
-        sub = sub.sort_values(["_fc_fill", "_pg_fill", "_row_order"], kind="mergesort")
-        sub["pregnancy_index"] = (np.arange(len(sub)) + 1).astype("int64")
-        # cleanup
-        return sub.drop(columns=["_fc_fill", "_pg_fill"])
-
-    n_jobs = int(cfg.get("n_jobs", 1))
-    if n_jobs in (0, 1):
-        parts = [_rank_one(mid) for mid in mothers]
-    else:
-        try:
-            from joblib import Parallel, delayed
-            be_args = _joblib_backend_args(cfg)
-            parts = Parallel(n_jobs=n_jobs, batch_size="auto", **be_args)(
-                delayed(_rank_one)(mid) for mid in mothers
-            )
-        except Exception as e:
-            print(f"[WARN] joblib unavailable or failed ({e}); falling back to single-thread.")
-            parts = [_rank_one(mid) for mid in mothers]
-
-    out = pd.concat(parts, ignore_index=False)
-    out = out.sort_values("_row_order").drop(columns=["_row_order", "_sort_fc", "_sort_pg"])
-    out["pregnancy_index"] = out["pregnancy_index"].astype("Int64")
-    return out.reset_index(drop=True)
-
-def parse_mothers_static(cfg: Dict) -> pd.DataFrame:
-    """Return per-(hashed_mother_id, pregnancy_index) static from the mothers CSV.
-       pregnancy_index is **derived per mother** by sorting (fetus_count, number_of_pregnancies_G)."""
-    path = cfg.get("mothers_csv")
-    if not path or not os.path.exists(path):
-        return pd.DataFrame()
-    df = pd.read_csv(path)
-    if "hashed_mother_id" not in df.columns:
-        raise ValueError("Mothers CSV missing 'hashed_mother_id'.")
-
-    # Keep curated columns if present
-    keep_cols = [c for c in [
-        "hashed_mother_id",
-        "fetus_count",                    # used for ranking (not kept in final unless you want it)
-        "number_of_pregnancies_G",       # tie-breaker for ranking
-        # demographics & anthropometrics
-        "age_on_date", "height", "weight_before_birth", "weight_before_pregnancy",
-        # obstetric history / parity
-        "number_of_births_P", "number_of_abortions_AB",
-        "number_of_cesareans_CS", "number_of_vaginal_birthes_after_cesarean_VBAC",
-        # hypertensive/diabetes disorders
-        "chronic_hypertension", "pregnancy_induced_hypertension", "preeclampsia", "super_imposed_preeclampsia",
-        "pregestational_diabetes", "gestational_diabetes_a1", "gestational_diabetes_a2", "gestational_diabetes_unspecified",
-        # anesthesia types (intrapartum)
-        "anesthesia_local", "anesthesia_epidural", "anesthesia_general", "anesthesia_spinal", "no_anesthesia",
-        # pre-birth vitals summaries (24h window)
-        "temp_24h_last_before_birth", "temp_24h_max_before_birth", "temp_24h_min_before_birth",
-        "systolic_pressure_24h_last_before_birth", "systolic_pressure_24h_max_before_birth", "systolic_pressure_24h_min_before_birth",
-        "diastolic_pressure_24h_last_before_birth", "diastolic_pressure_24h_max_before_birth", "diastolic_pressure_24h_min_before_birth",
-        "saturation_24h_last_before_birth", "saturation_24h_max_before_birth", "saturation_24h_min_before_birth",
-        # labor stage durations
-        "first_stage_hours", "second_stage_hours", "first_stage_begin", "first_stage_end",
-        # labor onset characteristics
-        "birth_start_spontaneous", "birth_start_cesarean", "birth_start_labor_induction", "birth_start_augmentation",
-        # VBAC now
-        "vbac_now",
-    ] if c in df.columns]
-
-    df = df[keep_cols].copy()
-
-    # Numeric coercion (except duration strings we parse below)
-    for c in df.columns:
-        if c in ("first_stage_begin", "first_stage_end", "hashed_mother_id"):
-            continue
-        if df[c].dtype == object:
-            df[c] = _coerce_num(df[c])
-
-    # Parse durations → minutes
-    for dur in ("first_stage_begin", "first_stage_end"):
-        if dur in df.columns:
-            df[dur] = df[dur].apply(_to_minutes)
-
-    # Labor stage minutes
-    def stage_minutes(row, hours_col, begin_col=None, end_col=None):
-        if hours_col in row and pd.notna(row[hours_col]):
-            return float(row[hours_col]) * 60.0
-        if begin_col and end_col and (pd.notna(row.get(begin_col)) and pd.notna(row.get(end_col))):
-            b, e = row.get(begin_col), row.get(end_col)
-            return e - b if e >= b else e
-        return np.nan
-
-    df["labor_stage1_dur_min"] = df.apply(
-        lambda r: stage_minutes(r, "first_stage_hours", "first_stage_begin", "first_stage_end"), axis=1
-    )
-    df["labor_stage2_dur_min"] = df.apply(lambda r: stage_minutes(r, "second_stage_hours"), axis=1)
-
-    # BMI from weight & height (cm → m)
-    if "height" in df.columns:
-        h_m = _coerce_num(df["height"]) / 100.0
-        if "weight_before_birth" in df.columns:
-            df["bmi"] = (_coerce_num(df["weight_before_birth"]) / (h_m ** 2)).replace([np.inf, -np.inf], np.nan)
-        elif "weight_before_pregnancy" in df.columns:
-            df["bmi"] = (_coerce_num(df["weight_before_pregnancy"]) / (h_m ** 2)).replace([np.inf, -np.inf], np.nan)
-
-    # Derived flags
-    if "number_of_births_P" in df.columns:
-        df["parity_primip"] = (df["number_of_births_P"].fillna(0) == 0).astype(int)
-    if "number_of_cesareans_CS" in df.columns:
-        df["prior_csection"] = (df["number_of_cesareans_CS"].fillna(0) > 0).astype(int)
-
-    # Ensure binaries
-    for c in [
-        "anesthesia_local", "anesthesia_epidural", "anesthesia_general", "anesthesia_spinal", "no_anesthesia",
-        "birth_start_spontaneous", "birth_start_cesarean", "birth_start_labor_induction", "birth_start_augmentation",
-        "vbac_now",
-    ]:
-        if c in df.columns:
-            df[c] = (_coerce_num(df[c]).fillna(0) > 0).astype(int)
-
-    # ---- NEW: derive pregnancy_index per mother in parallel ----
-    with timed("derive_pregnancy_index(mothers)"):
-        df = _assign_pregnancy_indices_parallel(df, cfg)
-
-    # Final slim columns to emit (now include pregnancy_index)
-    slim_cols = [c for c in [
-        "hashed_mother_id", "pregnancy_index",
-        "age_on_date", "bmi", "parity_primip", "number_of_pregnancies_G", "number_of_births_P",
-        "prior_csection",
-        "chronic_hypertension", "pregnancy_induced_hypertension", "preeclampsia", "super_imposed_preeclampsia",
-        "pregestational_diabetes", "gestational_diabetes_a1", "gestational_diabetes_a2", "gestational_diabetes_unspecified",
-        "anesthesia_local", "anesthesia_epidural", "anesthesia_general", "anesthesia_spinal", "no_anesthesia",
-        "temp_24h_last_before_birth", "temp_24h_max_before_birth", "temp_24h_min_before_birth",
-        "systolic_pressure_24h_last_before_birth", "systolic_pressure_24h_max_before_birth", "systolic_pressure_24h_min_before_birth",
-        "diastolic_pressure_24h_last_before_birth", "diastolic_pressure_24h_max_before_birth", "diastolic_pressure_24h_min_before_birth",
-        "saturation_24h_last_before_birth", "saturation_24h_max_before_birth", "saturation_24h_min_before_birth",
-        "labor_stage1_dur_min", "labor_stage2_dur_min",
-        "birth_start_spontaneous", "birth_start_cesarean", "birth_start_labor_induction", "birth_start_augmentation",
-        "vbac_now",
-    ] if c in df.columns]
-
-    df = df[slim_cols].drop_duplicates(subset=["hashed_mother_id", "pregnancy_index"]).reset_index(drop=True)
+def _ensure_plain_columns(df: pd.DataFrame, key_cols: List[str]) -> pd.DataFrame:
+    if df is None: return df
+    if isinstance(df.index, pd.MultiIndex):
+        if any(k in df.index.names for k in key_cols):
+            df = df.reset_index()
+    elif df.index.name in key_cols:
+        df = df.reset_index()
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated(keep="last")]
     return df
 
-def parse_fetus_by_mother(cfg: Dict) -> pd.DataFrame:
-    """Aggregate fetus/newborn table per **mother** (no pregnancy key available in fetus).
-       Gender/pose kept & encoded; later replicated across all pregnancies of that mother."""
-    global _POSE_CODEBOOK
-    path = cfg.get("fetus_csv")
-    if not path or not os.path.exists(path):
-        return pd.DataFrame()
-    df = pd.read_csv(path)
-    if "hashed_mother_id" not in df.columns:
-        raise ValueError("Fetus CSV missing 'hashed_mother_id'.")
-
-    # Coerce basic numeric fetus columns when present
-    for c in ["weight", "apgar1", "apgar5"]:
-        if c in df.columns:
-            df[c] = _coerce_num(df[c])
-
-    # Gender 0/1
-    if "child_gender" in df.columns:
-        df["gender_code"] = df["child_gender"].apply(_gender_to_bin)
-    else:
-        df["gender_code"] = np.nan
-
-    # Pose → code
-    if "pose" in df.columns:
-        codes, codebook = _factorize_pose(df["pose"])
-        df["pose_code"] = codes
-        _POSE_CODEBOOK = codebook
-        out_cb = cfg.get("out_pose_codebook_json")
-        if out_cb:
-            try:
-                os.makedirs(os.path.dirname(out_cb), exist_ok=True)
-                with open(out_cb, "w", encoding="utf-8") as f:
-                    json.dump(codebook, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"[WARN] Could not save pose codebook: {e}")
-    else:
-        df["pose_code"] = np.nan
-
-    # NICU
-    if "nicu_hospitalization" in df.columns:
-        df["nicu"] = (_coerce_num(df["nicu_hospitalization"]).fillna(0) > 0).astype(int)
-    elif "nicu" in df.columns:
-        df["nicu"] = (_coerce_num(df["nicu"]).fillna(0) > 0).astype(int)
-    else:
-        df["nicu"] = 0
-
-    g = df.groupby("hashed_mother_id", dropna=False)
-
-    def _mode_ignore_nan(s: pd.Series):
-        s = s.dropna()
-        if s.empty:
-            return np.nan
-        return s.mode().iloc[0]
-
-    agg = g.agg(
-        n_children=("child_gender", "count") if "child_gender" in df.columns else ("pose_code", "count"),
-        birthweight_min_g=("weight", "min") if "weight" in df.columns else ("nicu", "min"),
-        birthweight_max_g=("weight", "max") if "weight" in df.columns else ("nicu", "max"),
-        birthweight_mean_g=("weight", "mean") if "weight" in df.columns else ("nicu", "mean"),
-        apgar1_min=("apgar1", "min") if "apgar1" in df.columns else ("nicu", "min"),
-        apgar5_min=("apgar5", "min") if "apgar5" in df.columns else ("nicu", "min"),
-        any_nicu=("nicu", "max"),
-        gender_mode_code=("gender_code", _mode_ignore_nan),
-        gender_prop_male=("gender_code", "mean"),
-        pose_mode_code=("pose_code", _mode_ignore_nan),
-    ).reset_index()
-
-    if "gender_prop_male" in agg.columns:
-        agg["any_male"] = (agg["gender_prop_male"].fillna(0) > 0).astype(int)
-        agg["any_female"] = (agg["gender_prop_male"].fillna(1) < 1).astype(int)
-
-    return agg
-
 def _load_static_table(cfg: Dict) -> pd.DataFrame:
-    """Integrated static builder producing per-(mother, pregnancy_index) rows from mothers,
-       then left-joining the fetus-per-mother aggregates."""
-    with timed("build_mothers_static"):
-        mothers = parse_mothers_static(cfg)
-    with timed("build_fetus_by_mother"):
-        fetus = parse_fetus_by_mother(cfg)
-
-    if mothers.empty and fetus.empty:
+    path = os.path.join(cfg["base_dir"], "static_merged.parquet")
+    if not os.path.exists(path):
         return pd.DataFrame()
-
-    if fetus.empty:
-        static_merged = mothers.copy()
-    elif mothers.empty:
-        static_merged = fetus.copy()  # no pregnancy key available
+    st = pd.read_parquet(path)
+    if "hashed_mother_id" not in st.columns:
+        raise ValueError("static_merged.parquet must contain 'hashed_mother_id'.")
+    st["hashed_mother_id"] = st["hashed_mother_id"].astype(str)
+    if "pregnancy_index" in st.columns:
+        st["pregnancy_index"] = pd.to_numeric(st["pregnancy_index"], errors="coerce").astype("Int64")
+        st = st.drop_duplicates(subset=["hashed_mother_id","pregnancy_index"], keep="last")
     else:
-        # Replicate fetus aggregates across all pregnancies of the mother
-        static_merged = mothers.merge(fetus, on="hashed_mother_id", how="left")
+        st = st.drop_duplicates(subset=["hashed_mother_id"], keep="last")
+    return st
 
-    out_csv = cfg.get("out_static_csv")
-    if out_csv:
-        try:
-            os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-            static_merged.to_csv(out_csv, index=False)
-        except Exception as e:
-            print(f"[WARN] Could not save static CSV: {e}")
-
-    return static_merged
-
-
-# =============================================================================
-# Realtime + episodes
-# =============================================================================
 def _load_realtime(cfg: Dict) -> pd.DataFrame:
     pkl = cfg["realtime_pickle"]
     if not os.path.exists(pkl):
@@ -704,18 +405,18 @@ def _load_realtime(cfg: Dict) -> pd.DataFrame:
     rt["hashed_mother_id"] = rt["hashed_mother_id"].astype(str)
     rt["event_time_abs"] = _parse_datetime_series(rt["event_time_abs"])
     rt = rt.dropna(subset=["event_time_abs"]).copy()
-    return rt
 
-def _add_pregnancy_index(rt: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
     if "episode_idx" not in rt.columns:
         gap = pd.to_timedelta(int(cfg.get("episode_gap_days", 183)), unit="D")
         rt = rt.sort_values(["hashed_mother_id", "event_time_abs"])
         dt_ = rt.groupby("hashed_mother_id")["event_time_abs"].diff()
         new_ep = (dt_.isna()) | (dt_ > gap)
-        rt["episode_idx"] = new_ep.groupby("hashed_mother_id").cumsum().astype("int32")
+        rt["episode_idx"] = new_ep.groupby(rt["hashed_mother_id"]).cumsum().astype("int32")
     else:
         rt["episode_idx"] = pd.to_numeric(rt["episode_idx"], errors="coerce").fillna(0).astype("int32")
+    return rt
 
+def _add_pregnancy_index(rt: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
     ep_bounds = (rt.groupby(["hashed_mother_id", "episode_idx"], as_index=False)["event_time_abs"].agg(ep_start="min"))
     ep_bounds = ep_bounds.sort_values(["hashed_mother_id", "ep_start"])
     ep_bounds["pregnancy_index"] = ep_bounds.groupby("hashed_mother_id").cumcount() + 1
@@ -726,7 +427,7 @@ def _add_pregnancy_index(rt: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
 
 
 # =============================================================================
-# Plausibility mask
+# Plausibility masking
 # =============================================================================
 def _mask_implausibles_inplace(df: pd.DataFrame, cfg: Dict):
     pr = cfg.get("plausible_ranges", {})
@@ -739,7 +440,7 @@ def _mask_implausibles_inplace(df: pd.DataFrame, cfg: Dict):
 
 
 # =============================================================================
-# Feature engineering per (mother, episode)
+# Feature engineering for a (mother, episode)
 # =============================================================================
 def _features_for_group(frame: pd.DataFrame,
                         cfg: Dict,
@@ -813,7 +514,7 @@ def _features_for_group(frame: pd.DataFrame,
             for k in ("min","max","mean","std","median","slope_linfit","delta","delta_t"):
                 feat[f"{lab}_coarse_{k}"] = np.full(n, np.nan, np.float32)
 
-    # Derived: MAP, SI, PP
+    # Derived hemodynamics: MAP, SI (NO PP)
     pr = cfg.get("plausible_ranges", {})
     def _mask_by_key(s: pd.Series, key: str) -> pd.Series:
         if key not in pr: return s
@@ -842,28 +543,20 @@ def _features_for_group(frame: pd.DataFrame,
         SI = hr.divide(sys, fill_value=np.nan).where(sys != 0)
         SI = _mask_by_key(SI, "_SI")
         _run_stats_for_series(SI, "SI")
-        # Convenience
+
+        # For convenience (legacy)
         p_last = hr.reindex(f.index.union(grid)).sort_index().ffill().reindex(grid).to_numpy(dtype=np.float32)
         s_last = sys.reindex(f.index.union(grid)).sort_index().ffill().reindex(grid).to_numpy(dtype=np.float32)
         shock = np.divide(p_last, s_last, out=np.full_like(p_last, np.nan), where=(s_last != 0))
         feat["shock_index_fine_last"] = shock.astype(np.float32)
 
-    # PP
-    if (sys is not None) and (dia is not None):
-        PP = sys - dia
-        PP = _mask_by_key(PP, "_PP")
-        _run_stats_for_series(PP, "PP")
-
     # -------- Personalized deltas from STATIC baselines --------
     def _get_measurement_baseline(name: str) -> float:
-        """Find {alias}*24h_last_before_birth in static_row by substring match."""
         if static_row is None or static_row.empty: return np.nan
         aliases = [name] + CFG.get("measurement_baseline_alias", {}).get(name, [])
-        low_cols = {c.lower(): c for c in static_row.index.tolist()}
-        for col_l, col in low_cols.items():
-            if "24h_last_before_birth" not in col_l:
-                continue
-            if any(a.lower() in col_l for a in aliases):
+        for a in aliases:
+            col = f"{a}_24h_last_before_birth"
+            if col in static_row.index:
                 try:
                     return float(pd.to_numeric(pd.Series([static_row[col]])).iloc[0])
                 except Exception:
@@ -907,23 +600,21 @@ def _features_for_group(frame: pd.DataFrame,
 
     # Measurements personalized
     for v in measurements:
-        series_v = pd.to_numeric(f[v], errors="coerce") if v in f.columns else None
         base_v = _get_measurement_baseline(v)
+        series_v = pd.to_numeric(f[v], errors="coerce") if v in f.columns else None
         last_v = _fine_last_array(v, series_v)
         _attach_personalized(v, base_v, last_v)
 
     # Labs personalized
     for lab in labs:
-        series_l = pd.to_numeric(f[lab], errors="coerce") if lab in f.columns else None
         base_l = _get_lab_baseline(lab)
+        series_l = pd.to_numeric(f[lab], errors="coerce") if lab in f.columns else None
         last_l = _fine_last_array(lab, series_l)
         _attach_personalized(lab, base_l, last_l)
 
-    # Derived personalized baselines for MAP, SI, PP if we can compute components
+    # Derived personalized baselines for MAP & SI if components exist in static
     base_sys = _get_measurement_baseline("sistol")
     base_dia = _get_measurement_baseline("diastol")
-    base_hr  = _get_measurement_baseline("pulse")
-
     if not np.isnan(base_sys) and not np.isnan(base_dia):
         base_map = base_dia + (base_sys - base_dia)/3.0
         map_last = feat.get("MAP_fine_last", None)
@@ -932,13 +623,7 @@ def _features_for_group(frame: pd.DataFrame,
             map_last = _fine_last_array("MAP", map_series)
         _attach_personalized("MAP", base_map, map_last)
 
-        base_pp = base_sys - base_dia
-        pp_last = feat.get("PP_fine_last", None)
-        if pp_last is None and (sys is not None and dia is not None):
-            pp_series = sys - dia
-            pp_last = _fine_last_array("PP", pp_series)
-        _attach_personalized("PP", base_pp, pp_last)
-
+    base_hr  = _get_measurement_baseline("pulse")
     if not np.isnan(base_sys) and not np.isnan(base_hr) and base_sys != 0:
         base_si = base_hr / base_sys
         si_last = feat.get("SI_fine_last", None)
@@ -959,6 +644,12 @@ def _features_for_group(frame: pd.DataFrame,
 # Dose times loaders
 # =============================================================================
 def _melt_label_times_from_wide(df_labels: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build tidy dose/product timeline from a wide labels_doses_csv:
+      returns columns: [hashed_mother_id, episode_idx, dose_time]
+    Non-matching datetime strings are dropped (never coerced).
+    """
+    # Normalize episode_idx if needed
     if "episode_idx" not in df_labels.columns:
         if "pregnancy_index" in df_labels.columns:
             df_labels = df_labels.copy()
@@ -966,10 +657,12 @@ def _melt_label_times_from_wide(df_labels: pd.DataFrame) -> pd.DataFrame:
         else:
             raise ValueError("Labels must include 'episode_idx' or 'pregnancy_index'.")
 
+    # column name detection (case-insensitive)
     lower_cols = {c.lower(): c for c in df_labels.columns}
     dose_cols = [orig for low, orig in lower_cols.items() if low.startswith("blood_dose_")]
     prod_cols = [orig for low, orig in lower_cols.items() if low.startswith("blood_product_")]
     time_cols = dose_cols + prod_cols
+
     if not time_cols:
         return pd.DataFrame(columns=["hashed_mother_id", "episode_idx", "dose_time"])
 
@@ -994,6 +687,11 @@ def _melt_label_times_from_wide(df_labels: pd.DataFrame) -> pd.DataFrame:
     return long
 
 def _load_dose_times(cfg: Dict) -> pd.DataFrame:
+    """
+    Returns tidy dose times dataframe: [hashed_mother_id(str), episode_idx(Int64), dose_time(datetime64[ns])]
+    Priority: labels_doses_csv (wide) -> aligned_labels_csv (fallback where label>0 provides event times)
+    """
+    # Primary: wide dose/product CSV
     p_wide = cfg.get("labels_doses_csv", None)
     if p_wide and os.path.exists(p_wide):
         with timed("read_labels_doses_csv"):
@@ -1005,6 +703,7 @@ def _load_dose_times(cfg: Dict) -> pd.DataFrame:
                 doses = doses.sort_values(["hashed_mother_id","episode_idx","dose_time"], kind="mergesort").reset_index(drop=True)
             return doses
 
+    # Fallback: aligned labels CSV with event_time_abs,label
     p_align = cfg.get("aligned_labels_csv", None)
     if p_align and os.path.exists(p_align):
         with timed("read_aligned_labels_csv"):
@@ -1026,15 +725,29 @@ def _load_dose_times(cfg: Dict) -> pd.DataFrame:
             A = A.sort_values(["hashed_mother_id","episode_idx","dose_time"], kind="mergesort").reset_index(drop=True)
         return A
 
+    # No labels source found
     return pd.DataFrame(columns=["hashed_mother_id","episode_idx","dose_time"])
 
 
 # =============================================================================
-# Labeling: pre-dose last frame
+# Labeling: pre-dose last-frame per birth (drop between doses)
 # =============================================================================
 def _label_pre_dose_last_frame(snaps_sorted: pd.DataFrame,
                                dose_times_sorted: np.ndarray,
                                pos_window_ns: int) -> Tuple[pd.DataFrame, np.ndarray]:
+    """
+    snaps_sorted: columns include snapshot_time (sorted asc), hashed_mother_id, pregnancy_index
+    dose_times_sorted: np.ndarray[datetime64[ns]] sorted ascending (unique per birth)
+    Returns:
+      labs_df (with 'label' and 'trigger_dose_time'), and a boolean mask (rows to keep)
+    Rules:
+      - If no doses: keep all snaps as negatives.
+      - Else:
+          * Keep negatives only for t < first_dose
+          * For each dose d: find idx = rightmost snapshot strictly before d.
+              - If 0 < (d - t[idx]) <= pos_window: mark that idx as positive and keep it.
+          * Drop all other snapshots (between doses and after last dose).
+    """
     out = snaps_sorted.copy()
     ts = out["snapshot_time"].to_numpy(copy=False)
     ts_ns = ts.view("i8")  # int64 ns
@@ -1045,17 +758,21 @@ def _label_pre_dose_last_frame(snaps_sorted: pd.DataFrame,
     keep = np.zeros(n, dtype=bool)
 
     if dose_times_sorted.size == 0:
+        # No doses: keep everything as negatives
         keep[:] = True
         out["label"] = labels.astype("int8")
         out["trigger_dose_time"] = pd.Series(trigger_ns.view("datetime64[ns]"))
         return out, keep
 
-    ds_ns = dose_times_sorted.view("i8")
+    ds = dose_times_sorted
+    ds_ns = ds.view("i8")
 
+    # Keep negatives strictly before the first dose
     first_d = ds_ns[0]
     neg_mask = ts_ns < first_d
-    keep |= neg_mask
+    keep |= neg_mask  # negatives before first dose
 
+    # For each dose: mark the last snapshot STRICTLY before dose as positive if within window
     win = np.int64(pos_window_ns)
     pos_indices = []
     for d in ds_ns:
@@ -1063,19 +780,22 @@ def _label_pre_dose_last_frame(snaps_sorted: pd.DataFrame,
         if idx >= 0 and ts_ns[idx] < d:
             gap = d - ts_ns[idx]
             if 0 < gap <= win:
+                # mark positive (and prefer it over negative if it happens to be kept)
                 labels[idx] = 1
                 trigger_ns[idx] = d
                 pos_indices.append(idx)
 
     if pos_indices:
         pos_indices = np.unique(np.asarray(pos_indices))
-        keep[pos_indices] = True
+        keep[pos_indices] = True  # keep exactly these positive frames
 
+    # All snapshots after first dose and between subsequent doses are dropped
     out["label"] = labels.astype("int8")
     trig = trigger_ns.view("datetime64[ns]")
     trig = pd.Series(trig)
     trig[trigger_ns == np.iinfo("i8").min] = pd.NaT
     out["trigger_dose_time"] = trig.values
+
     return out, keep
 
 
@@ -1120,11 +840,13 @@ def _get_static_row(mid: str, preg: int) -> Optional[pd.Series]:
 def _dose_times_for_group(mid: str, ep: int) -> np.ndarray:
     if _DOSE_TIMES is None or _DOSE_TIMES.empty:
         return np.array([], dtype="datetime64[ns]")
-    sub = _DOSE_TIMES[( _DOSE_TIMES["hashed_mother_id"] == str(mid)) &
-                      (_DOSE_TIMES["episode_idx"].astype("Int64") == int(ep))]
+    D = _DOSE_TIMES
+    sub = D[(D["hashed_mother_id"] == str(mid)) & (D["episode_idx"].astype("Int64") == int(ep))]
     if sub.empty:
         return np.array([], dtype="datetime64[ns]")
-    arr = np.unique(sub["dose_time"].to_numpy(copy=False))
+    arr = sub["dose_time"].to_numpy(copy=False)
+    # ensure unique & sorted
+    arr = np.unique(arr)
     return arr
 
 def _one_worker_indices(key) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, List[str]]]:
@@ -1139,22 +861,29 @@ def _one_worker_indices(key) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, List[
     measurements = _CFG.get("measurements", [])
     labs = _CFG.get("labs", [])
 
+    # Build features on the uniform grid
     X_grp, Y_base, feat_cols = _features_for_group(grp, _CFG, measurements, labs, static_row)
     if X_grp.empty:
         return None
 
+    # Prepare snapshot frame
     snaps = Y_base.copy()
     snaps["episode_idx"] = int(ep)
     snaps["hashed_mother_id"] = str(mid)
     snaps = snaps.sort_values("snapshot_time").reset_index(drop=True)
 
+    # Dose times for this group
     dose_arr = _dose_times_for_group(str(mid), int(ep))
 
+    # Label using "pre-dose last-frame" semantics
     pos_win_ns = int(pd.to_timedelta(float(_CFG.get("label_pos_window_hours", 1.0)), unit="h").value)
     labs_df, keep_mask = _label_pre_dose_last_frame(snaps, dose_arr, pos_win_ns)
 
+    # Filter feature rows to only the kept snapshots
     kept_times = set(labs_df.loc[keep_mask, "snapshot_time"].astype("int64").to_numpy())
     X_grp = X_grp[X_grp["snapshot_time"].astype("int64").isin(kept_times)].reset_index(drop=True)
+
+    # Align labs_df rows to kept snapshots only
     labs_df = labs_df.loc[keep_mask].reset_index(drop=True)
     labs_df["episode_idx"] = int(ep)
 
@@ -1162,100 +891,25 @@ def _one_worker_indices(key) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, List[
 
 
 # =============================================================================
-# Measuring frequency filter
-# =============================================================================
-def _filter_rt_by_min_freq_and_doses(rt: pd.DataFrame, dose_times: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
-    thresh = float(cfg.get("min_vital_freq_per_hour", 0.0))
-    if thresh <= 0.0:
-        return rt
-
-    has_dose_mothers = set()
-    if dose_times is not None and not dose_times.empty:
-        has_dose_mothers = set(dose_times["hashed_mother_id"].astype(str).unique().tolist())
-
-    vital_cols = [c for c in cfg.get("measurements", []) if c in rt.columns]
-    if not vital_cols:
-        return rt
-
-    rth = rt.copy()
-    rth["hour_bin"] = rth["event_time_abs"].dt.floor("h")
-
-    keep_mothers = []
-    drop_mothers = []
-
-    for mid, g in rth.groupby("hashed_mother_id"):
-        if mid in has_dose_mothers:
-            keep_mothers.append(mid)
-            continue
-        n_hours = g["hour_bin"].nunique()
-        if n_hours == 0:
-            drop_mothers.append(mid)
-            continue
-        max_freq = 0.0
-        for v in vital_cols:
-            cnt = g[v].notna().sum()
-            freq = float(cnt) / float(n_hours)
-            if freq > max_freq:
-                max_freq = freq
-        if max_freq >= thresh:
-            keep_mothers.append(mid)
-        else:
-            drop_mothers.append(mid)
-
-    if drop_mothers:
-        print(f"[FILTER] Removing {len(drop_mothers):,} mothers (no doses & max vital freq < {thresh}/hour).")
-        rt = rt[rt["hashed_mother_id"].isin(keep_mothers)].copy()
-    else:
-        print("[FILTER] No mothers removed by measuring-frequency criterion.")
-
-    return rt
-
-
-# =============================================================================
 # Main builder
 # =============================================================================
-def _load_static_table(cfg: Dict) -> pd.DataFrame:
-    # (kept here so the function order matches earlier sections)
-    with timed("build_mothers_static"):
-        mothers = parse_mothers_static(cfg)
-    with timed("build_fetus_by_mother"):
-        fetus = parse_fetus_by_mother(cfg)
-    if mothers.empty and fetus.empty:
-        return pd.DataFrame()
-    if fetus.empty:
-        static_merged = mothers.copy()
-    elif mothers.empty:
-        static_merged = fetus.copy()
-    else:
-        static_merged = mothers.merge(fetus, on="hashed_mother_id", how="left")
-    out_csv = cfg.get("out_static_csv")
-    if out_csv:
-        try:
-            os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-            static_merged.to_csv(out_csv, index=False)
-        except Exception as e:
-            print(f"[WARN] Could not save static CSV: {e}")
-    return static_merged
-
 def build_dataset(cfg: Dict):
     with timed("load_realtime"):
         rt = _load_realtime(cfg)
-
-    with timed("load_dose_times"):
-        dose_times = _load_dose_times(cfg)
-
-    # Early measuring-frequency filter (as requested)
-    with timed("min_measuring_freq_filter"):
-        rt = _filter_rt_by_min_freq_and_doses(rt, dose_times, cfg)
 
     with timed("add_pregnancy_index"):
         rt = _add_pregnancy_index(rt, cfg)
 
     with timed("load_static"):
-        static_df_full = _load_static_table(cfg)  # per pregnancy from mothers (derived PI) + fetus-by-mother
+        static_df_full = _load_static_table(cfg)
+
+    with timed("load_dose_times"):
+        dose_times = _load_dose_times(cfg)  # tidy: [hashed_mother_id, episode_idx, dose_time]
 
     with timed("pre_worker_subsample"):
+        # For this labeling, subsample is typically not needed; leave disabled or adapt if desired
         if cfg.get("subsample_per_label", False):
+            # simple pass-through here; you can wire custom subsampling if needed
             rt_filt = _subsample_births_by_dose(rt, dose_times, cfg)
         else:
             rt_filt = rt.copy()
@@ -1311,7 +965,7 @@ def build_dataset(cfg: Dict):
         X_rt_only = pd.concat(feat_parts, ignore_index=True)
         Y_all = pd.concat(lab_parts,  ignore_index=True)
 
-    # -------- Merge static (drop measurement/lab-like cols to avoid leakage) --------
+    # -------- Prepare stripped static for merge --------
     with timed("merge_static_after"):
         static_df = static_df_full.copy()
         if not static_df.empty:
@@ -1337,6 +991,8 @@ def build_dataset(cfg: Dict):
 
             if "pregnancy_index" in static_df.columns:
                 static_df["pregnancy_index"] = pd.to_numeric(static_df["pregnancy_index"], errors="coerce").astype("Int64")
+
+            if "pregnancy_index" in static_df.columns:
                 X_rt_plus_static = X_rt_only.merge(
                     static_df, on=["hashed_mother_id","pregnancy_index"], how="left", validate="many_to_one"
                 )
@@ -1383,10 +1039,6 @@ def main():
     print(" - Labels           :", CFG['out_labels_all_parquet'])
     print(" - RT-only cols     :", CFG['out_feature_cols_rt_only_json'])
     print(" - RT+Static cols   :", CFG['out_feature_cols_rt_plus_static_json'])
-    if CFG.get("out_static_csv"):
-        print(" - Static (per preg):", CFG['out_static_csv'])
-    if CFG.get("out_pose_codebook_json"):
-        print(" - Pose codebook    :", CFG['out_pose_codebook_json'])
     print("\n[TIMING SUMMARY]")
     for k, v in sorted(_TIMINGS.items()):
         print(f"{k:>28s}: {v:.3f}s")
